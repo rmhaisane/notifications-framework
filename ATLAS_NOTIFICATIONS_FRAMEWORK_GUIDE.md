@@ -540,4 +540,9 @@ make migrate-up -C atlas.notifications.mailbox
 
 ---
 
+
+## Reference PR -
+- **Service PR**: https://github.com/Infoblox-CTO/feature.lab/pull/156
+- **EventSubtype PR**: https://github.com/Infoblox-CTO/atlas.notifications.config/pull/643
+
 *Last Updated: February 2026*
