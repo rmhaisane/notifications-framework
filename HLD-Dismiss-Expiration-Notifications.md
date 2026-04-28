@@ -44,12 +44,12 @@ Deliver a per-user dismiss capability that:
 |---|---|
 | FR-1 Dismiss action in portal | UI Dismiss button on every expiring-subscription mailbox item |
 | FR-2 Confirmation prompt | Modal with explicit "Yes, permanently dismiss" / Cancel |
-| FR-3 Suppression scope | `subscription_dismissals` row + processor/dispatcher suppression |
+| FR-3 Suppression scope | One `subscription_dismissals` row → suppression on **both** in-app and email channels (§4.1.1); enforced in mailbox + dispatcher + postoffice |
 | FR-4 Immediate removal | Mailbox archives matching items inside the same transaction |
 | FR-5 Dismiss link in email | Postoffice template extension with `{{ .DismissURL }}` |
 | FR-6 Authenticated dismissal | Signed JWT + portal authenticated confirmation page |
 | FR-7 Confirmation page | Postoffice-hosted page → user clicks Confirm |
-| FR-8 Suppression parity | Both channels call the same internal Dismiss API |
+| FR-8 Suppression parity | Both channels call the same internal Dismiss API; the resulting row suppresses both `in_app` and `email` deliveries (§4.1.1) |
 | FR-9 Per-user scope | Composite PK `(user_id, subscription_id)` |
 | FR-10 Persistence | Server-side Postgres row in mailbox DB |
 | NFR-1 Security | HMAC-signed JWT, `exp ≤ 7d`, single-use via Redis `jti` |
@@ -109,27 +109,133 @@ Deliver a per-user dismiss capability that:
 
 ---
 
+## 3.3 Subscription identity (canonical definition)
+
+Throughout this HLD `subscription_id` means **the `License.ID` UUID owned by [athena.license.service](../../athena.license.service)** — i.e. one row in the `licenses` table:
+
+```go
+// athena.license.service/pkg/svc/licenses/model/license.go
+type License struct {
+    ID         uuid.UUID   // <-- this is our subscription_id
+    AccountID  int64
+    Sku        string
+    StartDate  time.Time
+    EndDate    time.Time
+    ...
+}
+```
+
+**Why `License.ID` and not anything else**
+
+| Candidate | Why we did *not* pick it |
+|---|---|
+| `(account_id, sku)` tuple | Multiple co-existing licenses per SKU per account (renewals, evaluations, overlapping terms). A user dismissing one term must not silence a future renewal that legitimately re-enters the warning window. |
+| `sku` alone | Account-wide; violates FR-9 per-user *and* per-subscription scope. |
+| `entitlement_id` / `package_id` | Higher-level grouping; one entitlement can map to many `License` rows over time. Wrong granularity. |
+| `fingerprint` (alertmanager) | Recomputed per event by the notifications stack from `subtype + accountID + Location`. Opaque, not stable across template changes. Bad as a public key. |
+
+`License.ID` is the only identifier that is **stable, unique, and 1:1 with a billable term** — exactly what "this subscription" means to the user.
+
+**It is already on every expiry event** — verified in [athena.license.service/cmd/server/expired.go](../../athena.license.service/cmd/server/expired.go):
+
+```go
+func PublishEvent(subtype, accountID, subject, message, licenseID string, status pb.Event_Status) error {
+    ...
+    msg := &pb.Event{
+        Type:          pb.Event_ACCOUNT,
+        Subtype:       subtype,           // "entitlement-expired" | "entitlement-expiry-warning"
+        AccountId:     accountID,
+        ApplicationId: cli.cfg.AppID,
+        Location:      licenseID,         // <-- License.ID UUID, used today for dedup
+        Severity:      pb.Event_high,
+        Status:        status,            // RAISED | CLEARED
+        ProductName:   "account",
+        OccurredTime:  timestamppb.Now(),
+        Metadata:      metadata,          // short_subject, message, accountID
+    }
+    return cli.notifClient.Publish(context.Background(), msg)
+}
+```
+
+`RunExpiredHandler()` drives all three call-sites that publish expiry events (`entitlement-expired`, `entitlement-expiry-warning`, and the `CLEARED` renewal sweep). **Every one of them passes a non-empty `License.ID.String()` as `Location`**, so dispatcher and mailbox can always extract the dismissal key without any change to the upstream contract.
+
+**Required changes for clarity (small but mandatory)**
+
+To stop relying on the overloaded `Location` field everywhere downstream, we will:
+
+1. Add an explicit `subscription_id` entry to `Event.Metadata` in `PublishEvent`, set to `licenseID`. `Location` continues to carry the same value for backward compatibility (existing dedup keeps working).
+2. Add an `event_class` metadata entry with value `expiring_subscription` so dispatcher can cheaply decide whether the dismissal cache is even relevant.
+3. Update the events.processor / dispatcher recipient filter to read `Metadata["subscription_id"]` (preferred) and fall back to `Location` if absent — guarantees safe rollout against in-flight events.
+
+**Resulting normalized key**
+
+```
+dismissal_key = (user_id, subscription_id)
+            where subscription_id = License.ID.String()  -- UUID, lower-case canonical form
+```
+
+This is the key used by:
+
+- The PRIMARY KEY of `subscription_dismissals` (§4.1).
+- The dismissal cache in dispatcher and processor.
+- The JWT `subscription_id` claim in the email dismiss token (§5.4).
+- The audit-log entry (NFR-3).
+
+**Display vs identity**
+
+The UI and email templates show the human-friendly **SKU + account name** (the renderer already has `skuName` and `account_name` in scope). The Dismiss button/link always carries the underlying `License.ID` — never the SKU — so dismissing one expiring license does not silence a different license that happens to share the SKU.
+
+**Renewal interaction**
+
+When license-service publishes a `CLEARED` event for a renewed license (already implemented in `RunExpiredHandler`), the new replacement license has its own fresh `License.ID`. The previous dismissal is bound to the old `License.ID` and is therefore correctly *not* applied to the renewal — the user will see the next expiry warning when that new license eventually approaches end-of-term, which is the desired behavior.
+
+---
+
 ## 4. Data model
 
 ### 4.1 New table — `subscription_dismissals` (mailbox DB)
 
 ```sql
 CREATE TABLE subscription_dismissals (
-    user_id          TEXT        NOT NULL,
-    subscription_id  TEXT        NOT NULL,
-    account_id       TEXT        NOT NULL,
+    user_id          TEXT        NOT NULL,                 -- Athena user identifier
+    subscription_id  UUID        NOT NULL,                 -- = athena.license.service License.ID
+    account_id       TEXT        NOT NULL,                 -- numeric account id, stored as text for parity with notifications stack
     scope            TEXT        NOT NULL DEFAULT 'subscription',
-    channel          TEXT        NOT NULL,                  -- 'portal' | 'email'
+    source_channel   TEXT        NOT NULL,                 -- 'in_app' | 'email'  -- where the user clicked Dismiss (audit only)
     dismissed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (user_id, subscription_id)
 );
 
-CREATE INDEX ix_dismissals_account ON subscription_dismissals (account_id);
+CREATE INDEX ix_dismissals_account      ON subscription_dismissals (account_id);
 CREATE INDEX ix_dismissals_subscription ON subscription_dismissals (subscription_id);
 ```
 
 - `scope` is reserved for future expansion (e.g. `type`, `category`) — keeps the API stable.
+- `source_channel` is **descriptive only** — it records *where the dismiss action originated* for audit/analytics. **It does NOT scope the suppression**: see §4.1.1.
 - Cascade delete is handled via account/user lifecycle hooks (existing pattern in mailbox).
+
+### 4.1.1 Channel semantics — one row = suppression on **all** channels
+
+Notifications for an expiring subscription are delivered today on two user-facing channels:
+
+| Channel | Owner | Where suppression is enforced |
+|---|---|---|
+| **`in_app`** (mailbox / portal) | [atlas.notifications.mailbox](../../atlas.notifications.mailbox) | (a) read-path filter on `GET /v1/mailbox/notifications` and (b) write-path skip in the mailbox Kafka consumer |
+| **`email`** | [atlas.notifications.postoffice](../../atlas.notifications.postoffice) (via [atlas.notifications.dispatcher](../../atlas.notifications.dispatcher) recipient resolution) | recipient drop in dispatcher *and* hard skip in postoffice email renderer |
+
+**Rule (FR-3, FR-8):** a single `subscription_dismissals` row for `(user_id, subscription_id)` permanently suppresses **every channel** for that pair. There is no "dismiss email only" or "dismiss in-app only" mode in 26.4.
+
+Consequences:
+
+- The dismiss API request body **does not accept a channel field**. The button in the portal and the link in the email both produce identical suppression.
+- `source_channel` on the table is `in_app` when the user clicked the in-app Dismiss button, `email` when they used the tokenized link, and `admin` for the support override (§5.1). It is metadata, not a filter key.
+- Dispatcher's recipient-drop logic and mailbox's read/write filters share **one cache lookup**: `IsDismissed(user_id, subscription_id) bool`. They never branch on `source_channel`.
+- Future per-channel granularity ("silence email but keep in-app") would be a new feature: it would change the PK to `(user_id, subscription_id, channel)`, add `channel` to the cache key, and require a UI change. Out of scope for PTCI-4043.
+
+Why not store `channel = 'all' | 'in_app' | 'email'` today?
+
+- The FS explicitly demands suppression on **every** channel (FR-3, FR-8). A per-channel column would introduce ambiguity ("is `'all'` a third value, or the absence of `'in_app'`/`'email'` rows?") with no functional benefit.
+- Keeping the PK at `(user_id, subscription_id)` makes the cache simpler and guarantees the FR-9 "per-user" invariant via the database, not application code.
 
 ### 4.2 Existing per-user notification status
 
@@ -150,15 +256,21 @@ POST /v1/mailbox/dismissals
 Authorization: Bearer <user JWT>
 Content-Type: application/json
 {
-  "subscription_id": "sub_abc123"
+  "subscription_id": "<License.ID UUID>"
 }
 
 201 Created
 {
-  "user_id": "...", "subscription_id": "sub_abc123",
-  "account_id": "...", "dismissed_at": "...", "channel": "portal"
+  "user_id":         "...",
+  "subscription_id": "<License.ID UUID>",
+  "account_id":      "...",
+  "dismissed_at":    "2026-04-28T15:17:09Z",
+  "source_channel": "in_app",          // audit only — suppression applies to in_app + email
+  "suppresses":      ["in_app", "email"]
 }
 ```
+
+Request body intentionally omits any channel field — see §4.1.1 (one dismiss = all channels). The response includes `suppresses` so clients have an explicit, forward-compatible enumeration.
 
 ```
 GET  /v1/mailbox/dismissals
@@ -171,14 +283,73 @@ DELETE /v1/mailbox/dismissals/{subscription_id}     # not exposed in UI; admin-o
 POST /v1/internal/mailbox/dismissals
 Authorization: Bearer <S2S JWT>
 {
-  "user_id": "...",
-  "subscription_id": "...",
-  "account_id": "...",
-  "channel": "email"
+  "user_id":         "...",
+  "subscription_id": "<License.ID UUID>",
+  "account_id":      "...",
+  "source_channel": "email"           // 'in_app' | 'email' | 'admin' — audit only
 }
 ```
 
 Used by postoffice after token verification; uses Athena S2S claims (existing pattern).
+
+### 5.2.1 Idempotency & concurrency guarantees
+
+Both write endpoints (`POST /v1/mailbox/dismissals` and `POST /v1/internal/mailbox/dismissals`) are **idempotent on `(user_id, subscription_id)`** and **safe under arbitrary retries** by client, gateway, or Kafka redelivery.
+
+**Contract**
+
+| Aspect | Behavior |
+|---|---|
+| Idempotency key | `(user_id, subscription_id)` — the table PRIMARY KEY (§4.1) |
+| First successful call | `201 Created` + dismissal row written |
+| Repeat call (same user+sub) | `200 OK` + the existing row returned unchanged |
+| `dismissed_at` | Set on first write only; **never updated** by retries |
+| `source_channel` | Set on first write only; **never updated** by retries — preserves true audit origin |
+| Concurrent first writes | Exactly one row created via `INSERT ... ON CONFLICT (user_id, subscription_id) DO NOTHING RETURNING *` + `RETURNING`-coalesce read; other callers observe `200 OK` with the winning row |
+| `dismissal.changed` Kafka event | Emitted **only** on actual insert (`xmax = 0` check); duplicate writes do **not** re-emit |
+| Audit log | One entry per *successful insert*; retries log a `dismiss_retry_noop` debug line, not a duplicate audit row |
+| HTTP error semantics | `4xx` → safe to retry; `5xx` after commit → safe to retry (next call returns `200 OK`); never produces partial state |
+
+**SQL pattern (mailbox)**
+
+```sql
+WITH ins AS (
+    INSERT INTO subscription_dismissals
+        (user_id, subscription_id, account_id, scope, source_channel)
+    VALUES ($1, $2, $3, 'subscription', $4)
+    ON CONFLICT (user_id, subscription_id) DO NOTHING
+    RETURNING *, true AS inserted
+)
+SELECT * FROM ins
+UNION ALL
+SELECT *, false AS inserted FROM subscription_dismissals
+WHERE user_id = $1 AND subscription_id = $2
+LIMIT 1;
+```
+
+The single-statement pattern guarantees:
+
+- No `SELECT-then-INSERT` race between concurrent callers.
+- The handler reads `inserted` to decide whether to publish the Kafka event and emit the audit log.
+- The transaction also performs the in-app archive update (§6.1 step 4) and the Kafka publish through the **outbox table** (existing pattern in mailbox), so the dismissal row + audit + Kafka event are committed atomically. Retries that observe `inserted=false` skip both the archive update and the Kafka publish, since the original commit already produced them.
+
+**Email-channel implications (NFR-1 interaction)**
+
+The dismiss-token JTI is consumed in Redis **before** the S2S call to mailbox (§6.2 step 4). Therefore:
+
+- A redelivery of the *same* email click with the *same* token → blocked at the JTI check (`410 Gone`); never reaches mailbox.
+- A retry of the S2S call inside postoffice (e.g. transient 5xx) → reuses the JTI logically by skipping the `SET NX` step on its own retry path; mailbox is also idempotent so a duplicated S2S call is harmless and yields `200 OK`.
+- A user who clicks an *email link*, then *also* dismisses from the portal → second call is a no-op; row already exists.
+
+**Read endpoints**
+
+`GET /v1/mailbox/dismissals` and `GET /v1/internal/mailbox/dismissals/{user}/{sub}` are inherently idempotent and side-effect-free.
+
+**Delete / undismiss (admin)**
+
+`DELETE /v1/mailbox/dismissals/{subscription_id}` is idempotent: missing row → `204 No Content`, present row → `204 No Content` after delete. Emits an `undismissed` Kafka event only when a row was actually removed.
+
+---
 
 ### 5.3 Postoffice — email confirmation
 
@@ -219,7 +390,7 @@ POST /v1/dismiss/confirm
 2. Click → modal: *"This permanently stops all future warnings for this subscription. This cannot be undone."* — **Confirm / Cancel**.
 3. UI → `POST /v1/mailbox/dismissals`.
 4. Mailbox in one transaction:
-   - inserts/`ON CONFLICT DO NOTHING` into `subscription_dismissals`,
+   - inserts/`ON CONFLICT DO NOTHING` into `subscription_dismissals` (`source_channel='in_app'`),
    - sets `dismissed=true` on every existing in-app row for `(user_id, subscription_id)`,
    - emits `dismissal.changed` Kafka event,
    - emits audit-log line.
@@ -234,7 +405,7 @@ POST /v1/dismiss/confirm
 4. **Confirm** → `POST /v1/dismiss/confirm`:
    - verify signature, `purpose`, `exp`,
    - `SET NX dismiss:jti:<jti>` — fail if already used,
-   - call mailbox `POST /v1/internal/mailbox/dismissals` with `channel="email"`,
+   - call mailbox `POST /v1/internal/mailbox/dismissals` with `source_channel="email"`,
    - render success page.
 5. Mailbox path identical to §6.1 (FR-8 parity).
 
@@ -260,14 +431,109 @@ Mailbox publishes to `notifications.dismissals.changed`:
 ```jsonc
 {
   "event": "dismissed" | "undismissed",
-  "user_id": "...",
-  "subscription_id": "...",
-  "account_id": "...",
+  "user_id":         "...",
+  "subscription_id": "<License.ID UUID>",
+  "account_id":      "...",
+  "source_channel": "in_app" | "email" | "admin",   // audit only
   "ts": "..."
 }
 ```
 
 Dispatcher (`pkg/mq/handler_dismissals_changes.go`) and processor consume this and update their in-memory caches (TTL fallback 5 min).
+
+### 6.6 Cache-invalidation race (cold-cache window)
+
+There is an inherent gap between *(a)* mailbox committing the dismissal row and *(b)* dispatcher / events.processor receiving the `dismissal.changed` Kafka event and updating their local caches. In practice this gap is sub-second (Dapr/Kafka in-cluster), but the worst case is bounded by Kafka consumer lag and pod cold-start.
+
+#### 6.6.1 The race
+
+```
+t0   user clicks Dismiss in portal
+t0+ε mailbox commits row, emits dismissal.changed, returns 201
+t1   RunExpiredHandler in athena.license.service publishes
+       entitlement-expiry-warning for the same License.ID
+t2   dispatcher resolves recipients; cache still cold for this user
+       → dispatcher does NOT drop the user
+       → in-app + email warning slip through  ❌
+t3   dispatcher consumes dismissal.changed, cache now hot
+       (all subsequent events suppressed correctly ✅)
+```
+
+The race window is `t3 − t0`. During that window **one last warning may be delivered** even though the user has already dismissed the subscription.
+
+#### 6.6.2 Why the cron schedule makes this unlikely-but-not-impossible
+
+`RunExpiredHandler` runs as the `entitlement-expired-notification` CronJob (daily — see [athena.license.service/site/content/operator/getting-started.md](../../athena.license.service/site/content/operator/getting-started.md#L58)). Inside one cron run it iterates every account and emits one event per qualifying license. If the user clicks Dismiss while that cron is *currently iterating* their account, dispatcher's cache may not yet be primed when the recipient resolution for *their* event happens a few hundred milliseconds later. The window is small but real.
+
+#### 6.6.3 Decision: **accept eventual consistency for general events; add read-through-on-miss for expiring-subscription events only**
+
+The platform-wide cache invalidation pattern (filters, subscriptions) is eventually consistent and the team has accepted that for high-volume general notifications. We diverge from it **only** for the expiring-subscription flow because:
+
+- Volume is tiny (single-digit dismissals per user per year, daily cron).
+- A "one last email after I dismissed" experience is exactly the alert-fatigue problem this feature was created to solve. Letting it slip through partially defeats the purpose.
+- The check is cheap: at most one indexed lookup keyed by `(user_id, subscription_id)`, only on the dismissal-relevant branch.
+
+**Mechanism**
+
+In dispatcher and events.processor, the dismissal cache becomes a **negative-result cache with a short TTL plus read-through on miss**, but **only for the `expiring_subscription` event class**:
+
+```go
+// pseudo-code, dispatcher recipient filter
+func (c *DismissalCache) IsDismissed(ctx context.Context, eventClass, userID string, subID uuid.UUID) bool {
+    if eventClass != "expiring_subscription" {
+        return c.lookupHotOnly(userID, subID)            // existing fast path
+    }
+    if v, ok := c.lookupHotOnly(userID, subID); ok {
+        return v                                          // hit (positive or negative)
+    }
+    // Cold: read-through to mailbox source of truth.
+    dismissed, err := c.mailboxClient.IsDismissed(ctx, userID, subID)
+    if err != nil {
+        // fail-open is safe (we may send one extra warning, never silence wrongly)
+        c.metrics.IncReadThroughError()
+        return false
+    }
+    c.put(userID, subID, dismissed, negativeTTL)         // 30s neg TTL
+    return dismissed
+}
+```
+
+Properties:
+
+- **Bounded extra load** — the read-through only fires for cache misses on expiring-subscription events. Hit ratio after warm-up is ~100 %; cold misses are at most one per `(user, subscription)` per pod lifetime.
+- **Short negative TTL (30 s)** caps the staleness window for dismissals that fire *after* a negative cache entry was filled. A subsequent `dismissal.changed` event still invalidates earlier than the TTL.
+- **Fail-open** on read-through error — in the worst case the user sees one extra warning, never the inverse (a wrongful silence on an undismissed subscription). This matches the safety bias of the rest of the notifications stack.
+- The non-expiry hot path is **unchanged**, so we don't pay the read-through cost on the high-volume general traffic.
+
+**Mailbox `IsDismissed` lookup endpoint**
+
+```
+GET /v1/internal/mailbox/dismissals/{user_id}/{subscription_id}
+  → 200 { "dismissed": true,  "dismissed_at": "..." }
+  → 200 { "dismissed": false }
+```
+
+S2S only. Single indexed PK lookup. Cached at the dispatcher side per the rules above.
+
+#### 6.6.4 Optional source-side guard
+
+`RunExpiredHandler` is the only producer of expiring-subscription events today. As an additional safety net we may, in a follow-up story (not required for 26.4), have it call mailbox's `IsDismissed` before publishing each event. This shrinks the window further and lets us skip publishing entirely for dismissed `(user, sub)` pairs. Trade-off: one extra S2S call per license per cron tick \u2014 acceptable given the cron is daily and the license set per account is bounded.
+
+#### 6.6.5 Observability for the race
+
+- `dismissals_cache_readthrough_total{result="hit_dismissed"|"hit_active"|"error"}`
+- `notifications_suppressed_total{reason="dismissed", layer="dispatcher", path="readthrough"|"cache"}`
+- `dismissal_invalidation_lag_seconds` \u2014 histogram of `(dispatcher_apply_ts - mailbox_commit_ts)` derived from Kafka headers; alert if `p99 > 5s`.
+- A single counter `expiry_warning_sent_after_dismiss_total` populated by mailbox when it later detects a write attempt for an already-dismissed `(user, sub)` (best-effort signal that a slip-through actually occurred).
+
+#### 6.6.6 Acceptance
+
+With (a) Kafka-driven invalidation, (b) read-through-on-miss for expiring-subscription only, and (c) optional source-side guard in a follow-up, the probability of a "one last warning after dismiss" is reduced to:
+
+- **Zero** for in-app notifications, because mailbox is the source of truth and its read/write paths consult `subscription_dismissals` directly (no cache for the authoritative writer).
+- **Near-zero** for email, because dispatcher will read-through on the first cold miss, and the daily cron cadence makes a *second* expiry email in the same window structurally impossible.
+
+This is documented as the explicit, accepted behaviour for FR-3 / FR-8.
 
 ---
 
@@ -291,9 +557,9 @@ OWASP coverage: A01 (access control via Athena + claim check), A02 (signed token
 
 **Metrics**
 
-- `dismissals_created_total{channel="portal"|"email"}`
+- `dismissals_created_total{source_channel="in_app"|"email"|"admin"}`
 - `dismissals_undone_total{actor="admin"}`
-- `notifications_suppressed_total{reason="dismissed", layer="processor"|"dispatcher"}`
+- `notifications_suppressed_total{reason="dismissed", layer="mailbox"|"dispatcher"|"postoffice", channel="in_app"|"email"}`
 - `dismiss_token_invalid_total{reason="signature"|"expired"|"reused"|"purpose"}`
 - `dismiss_api_duration_seconds` (histogram, SLO < 2s)
 - `dismissals_cache_hit_ratio`
